@@ -129,6 +129,85 @@ def load_trade_data(path: Path) -> pd.DataFrame:
     return trade
 
 
+def build_trade_subset(
+    trade: pd.DataFrame,
+    forced_goods: pd.DataFrame,
+    good_to_hs_codes: dict[str, list[str]],
+    code_to_iso3: dict[int, str],
+) -> pd.DataFrame:
+    trade = trade.copy()
+    trade["exporter_iso3"] = trade["i"].map(code_to_iso3)
+    trade["importer_iso3"] = trade["j"].map(code_to_iso3)
+    trade = trade.loc[trade["exporter_iso3"].notna() & trade["importer_iso3"].notna()].copy()
+
+    relevant_countries = {
+        getattr(row, "country_iso3", None)
+        for row in forced_goods.itertuples(index=False)
+        if getattr(row, "country_iso3", None) is not None and not pd.isna(getattr(row, "country_iso3", None))
+    }
+    if not relevant_countries:
+        raise ValueError("No valid country ISO3 mappings were found for forced-labor goods.")
+
+    trade = trade.loc[
+        trade["exporter_iso3"].isin(relevant_countries) | trade["importer_iso3"].isin(relevant_countries)
+    ].copy()
+
+    matched_parts = []
+    for row in forced_goods.itertuples(index=False):
+        origin_iso3 = getattr(row, "country_iso3", None)
+        if pd.isna(origin_iso3):
+            continue
+
+        hs_codes = good_to_hs_codes.get(normalize_text(row.Good), [])
+        for hs_code in hs_codes:
+            prefix_mask = trade["k"].astype(str).str.startswith(hs_code, na=False)
+            exporter_mask = trade["exporter_iso3"].eq(origin_iso3) & prefix_mask
+            importer_mask = trade["importer_iso3"].eq(origin_iso3) & prefix_mask
+
+            if exporter_mask.any():
+                exporter_matches = trade.loc[exporter_mask].copy()
+                exporter_matches["match_side"] = "exporter"
+                exporter_matches["matched_country_iso3"] = origin_iso3
+                exporter_matches["good"] = row.Good
+                exporter_matches["hs_code"] = hs_code
+                matched_parts.append(exporter_matches)
+
+            if importer_mask.any():
+                importer_matches = trade.loc[importer_mask].copy()
+                importer_matches["match_side"] = "importer"
+                importer_matches["matched_country_iso3"] = origin_iso3
+                importer_matches["good"] = row.Good
+                importer_matches["hs_code"] = hs_code
+                matched_parts.append(importer_matches)
+
+    if not matched_parts:
+        raise ValueError("No BACI rows matched the forced-labor country/product pairs.")
+
+    subset = pd.concat(matched_parts, ignore_index=True)
+    subset = subset.rename(columns={"v": "value_thousand_usd", "q": "weight_metric_tons"})
+    subset = subset[
+        [
+            "t",
+            "i",
+            "j",
+            "k",
+            "value_thousand_usd",
+            "weight_metric_tons",
+            "exporter_iso3",
+            "importer_iso3",
+            "match_side",
+            "matched_country_iso3",
+            "good",
+            "hs_code",
+        ]
+    ]
+    subset = subset.sort_values(
+        ["matched_country_iso3", "match_side", "good", "hs_code", "t", "i", "j"],
+        ascending=[True, True, True, True, True, True, True],
+    ).reset_index(drop=True)
+    return subset
+
+
 def compute_exposure(
     trade: pd.DataFrame,
     forced_goods: pd.DataFrame,
@@ -242,12 +321,15 @@ def main() -> None:
     good_to_hs_codes = build_good_to_hs_codes(DATA_DIR / "list_of_goods_hs_codes.csv")
     trade = load_trade_data(DATA_DIR / "BACI_HS22_Y2024_V202601.csv")
 
+    subset = build_trade_subset(trade, forced_goods, good_to_hs_codes, code_to_iso3)
     exposure, summary = compute_exposure(trade, forced_goods, good_to_hs_codes, code_to_iso3)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    subset.to_csv(OUTPUT_DIR / "baci_forced_labor_subset.csv", index=False)
     exposure.to_csv(OUTPUT_DIR / "eu_forced_labor_exposure_by_origin.csv", index=False)
     summary.to_csv(OUTPUT_DIR / "eu_forced_labor_exposure_summary.csv", index=False)
 
+    print("Saved baci_forced_labor_subset.csv")
     print("Saved eu_forced_labor_exposure_by_origin.csv")
     print("Saved eu_forced_labor_exposure_summary.csv")
     print("\nEU importer summary:")
