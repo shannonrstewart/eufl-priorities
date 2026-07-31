@@ -36,6 +36,13 @@ EU_COUNTRIES = {
     "SWE": "Sweden",
 }
 
+EFTA_COUNTRIES = {
+    "ISL": "Iceland",
+    "LIE": "Liechtenstein",
+    "NOR": "Norway",
+    "CHE": "Switzerland",
+}
+
 
 def normalize_text(value: object) -> str:
     if pd.isna(value):
@@ -129,6 +136,36 @@ def load_trade_data(path: Path) -> pd.DataFrame:
     return trade
 
 
+EU_IMPORTER_BLOC = "EU"
+EEA_IMPORTER_BLOC = "EEA"
+
+
+
+def format_numeric_output(
+    df: pd.DataFrame,
+    value_cols: list[str],
+    weight_cols: list[str],
+) -> pd.DataFrame:
+    df = df.copy()
+    for col in value_cols:
+        if col in df.columns:
+            df[col] = (
+                pd.to_numeric(df[col], errors="coerce")
+                .round(0)
+                .astype("Int64")
+                .apply(lambda x: f"{x:,}" if pd.notna(x) else "")
+            )
+    for col in weight_cols:
+        if col in df.columns:
+            df[col] = (
+                pd.to_numeric(df[col], errors="coerce")
+                .round(0)
+                .astype("Int64")
+                .apply(lambda x: f"{x:,}" if pd.notna(x) else "")
+            )
+    return df
+
+
 def build_trade_subset(
     trade: pd.DataFrame,
     forced_goods: pd.DataFrame,
@@ -162,7 +199,6 @@ def build_trade_subset(
         for hs_code in hs_codes:
             prefix_mask = trade["k"].astype(str).str.startswith(hs_code, na=False)
             exporter_mask = trade["exporter_iso3"].eq(origin_iso3) & prefix_mask
-            importer_mask = trade["importer_iso3"].eq(origin_iso3) & prefix_mask
 
             if exporter_mask.any():
                 exporter_matches = trade.loc[exporter_mask].copy()
@@ -172,26 +208,19 @@ def build_trade_subset(
                 exporter_matches["hs_code"] = hs_code
                 matched_parts.append(exporter_matches)
 
-            if importer_mask.any():
-                importer_matches = trade.loc[importer_mask].copy()
-                importer_matches["match_side"] = "importer"
-                importer_matches["matched_country_iso3"] = origin_iso3
-                importer_matches["good"] = row.Good
-                importer_matches["hs_code"] = hs_code
-                matched_parts.append(importer_matches)
-
     if not matched_parts:
         raise ValueError("No BACI rows matched the forced-labor country/product pairs.")
 
     subset = pd.concat(matched_parts, ignore_index=True)
     subset = subset.rename(columns={"v": "value_thousand_usd", "q": "weight_metric_tons"})
+    subset["value_usd"] = subset["value_thousand_usd"] * 1000
     subset = subset[
         [
             "t",
             "i",
             "j",
             "k",
-            "value_thousand_usd",
+            "value_usd",
             "weight_metric_tons",
             "exporter_iso3",
             "importer_iso3",
@@ -206,6 +235,136 @@ def build_trade_subset(
         ascending=[True, True, True, True, True, True, True],
     ).reset_index(drop=True)
     return subset
+
+
+def aggregate_eu_importer_bloc(exposure: pd.DataFrame) -> pd.DataFrame:
+    grouped = (
+        exposure.groupby(["exporter_iso3", "good", "hs_code"], as_index=False)
+        .agg(
+            value_usd=("value_usd", "sum"),
+            weight_metric_tons=("weight_metric_tons", "sum"),
+        )
+    )
+    grouped["importer_iso3"] = EU_IMPORTER_BLOC
+    grouped = grouped[
+        [
+            "importer_iso3",
+            "exporter_iso3",
+            "good",
+            "hs_code",
+            "value_usd",
+            "weight_metric_tons",
+        ]
+    ]
+    grouped = grouped.sort_values(
+        ["value_usd", "weight_metric_tons", "good", "exporter_iso3"],
+        ascending=[False, False, True, True],
+    ).reset_index(drop=True)
+    return grouped
+
+
+def summarize_eu_bloc(exposure: pd.DataFrame) -> pd.DataFrame:
+    total_value_usd = int(exposure["value_usd"].sum())
+    total_weight_metric_tons = float(exposure["weight_metric_tons"].sum())
+
+    top_good = (
+        exposure.groupby("good", as_index=False)
+        .agg(
+            value_usd=("value_usd", "sum"),
+            weight_metric_tons=("weight_metric_tons", "sum"),
+        )
+        .sort_values(["value_usd", "weight_metric_tons"], ascending=[False, False])
+        .head(1)
+    )
+
+    top_good_name = top_good["good"].iloc[0] if not top_good.empty else ""
+    top_good_value_usd = int(top_good["value_usd"].iloc[0]) if not top_good.empty else 0
+    top_good_weight_metric_tons = float(top_good["weight_metric_tons"].iloc[0]) if not top_good.empty else 0.0
+
+    return pd.DataFrame(
+        [
+            {
+                "importer_iso3": EU_IMPORTER_BLOC,
+                "total_value_usd": total_value_usd,
+                "total_weight_metric_tons": total_weight_metric_tons,
+                "top_good": top_good_name,
+                "top_value_usd": top_good_value_usd,
+                "top_weight_metric_tons": top_good_weight_metric_tons,
+            }
+        ]
+    )
+
+
+def rank_eu_bloc_products(exposure: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
+    ranked = (
+        exposure.groupby(["good"], as_index=False)
+        .agg(
+            value_usd=("value_usd", "sum"),
+            weight_metric_tons=("weight_metric_tons", "sum"),
+        )
+        .sort_values(["value_usd", "weight_metric_tons"], ascending=[False, False])
+        .head(top_n)
+        .reset_index(drop=True)
+    )
+    return ranked
+
+
+def aggregate_eea_importer_bloc(exposure: pd.DataFrame) -> pd.DataFrame:
+    grouped = (
+        exposure.groupby(["exporter_iso3", "good", "hs_code"], as_index=False)
+        .agg(
+            value_usd=("value_usd", "sum"),
+            weight_metric_tons=("weight_metric_tons", "sum"),
+        )
+    )
+    grouped["importer_iso3"] = EEA_IMPORTER_BLOC
+    grouped = grouped[
+        [
+            "importer_iso3",
+            "exporter_iso3",
+            "good",
+            "hs_code",
+            "value_usd",
+            "weight_metric_tons",
+        ]
+    ]
+    grouped = grouped.sort_values(
+        ["value_usd", "weight_metric_tons", "good", "exporter_iso3"],
+        ascending=[False, False, True, True],
+    ).reset_index(drop=True)
+    return grouped
+
+
+def summarize_eea_bloc(exposure: pd.DataFrame) -> pd.DataFrame:
+    total_value_usd = int(exposure["value_usd"].sum())
+    total_weight_metric_tons = float(exposure["weight_metric_tons"].sum())
+
+    top_good = (
+        exposure.groupby("good", as_index=False)
+        .agg(
+            value_usd=("value_usd", "sum"),
+            weight_metric_tons=("weight_metric_tons", "sum"),
+        )
+        .sort_values(["value_usd", "weight_metric_tons"], ascending=[False, False])
+        .head(1)
+    )
+
+    top_good_name = top_good["good"].iloc[0] if not top_good.empty else ""
+    top_good_value_usd = int(top_good["value_usd"].iloc[0]) if not top_good.empty else 0
+    top_good_weight_metric_tons = float(top_good["weight_metric_tons"].iloc[0]) if not top_good.empty else 0.0
+
+    return pd.DataFrame(
+        [
+            {
+                "importer_iso3": EEA_IMPORTER_BLOC,
+                "total_value_usd": total_value_usd,
+                "total_weight_metric_tons": total_weight_metric_tons,
+                "top_good": top_good_name,
+                "top_value_usd": top_good_value_usd,
+                "top_weight_metric_tons": top_good_weight_metric_tons,
+            }
+        ]
+    )
 
 
 def compute_exposure(
@@ -237,7 +396,9 @@ def compute_exposure(
     trade["importer_iso3"] = trade["j"].map(code_to_iso3)
     trade = trade.loc[trade["exporter_iso3"].notna() & trade["importer_iso3"].notna()].copy()
 
-    trade = trade.loc[trade["importer_iso3"].isin(EU_COUNTRIES)].copy()
+    # keep flows where the importer is in the EU or in EFTA
+    valid_importers = set(EU_COUNTRIES) | set(EFTA_COUNTRIES)
+    trade = trade.loc[trade["importer_iso3"].isin(valid_importers)].copy()
 
     exposure_parts = []
     for _, match in matched_products.iterrows():
@@ -259,23 +420,25 @@ def compute_exposure(
 
     exposure = pd.concat(exposure_parts, ignore_index=True)
     exposure = exposure.rename(columns={"v": "value_thousand_usd", "q": "weight_metric_tons"})
+    exposure["value_usd"] = exposure["value_thousand_usd"] * 1000
     exposure = exposure[[
         "importer_iso3",
         "exporter_iso3",
         "good",
         "hs_code",
-        "value_thousand_usd",
+        "value_usd",
         "weight_metric_tons",
     ]]
 
     exposure = (
         exposure.groupby(["importer_iso3", "exporter_iso3", "good", "hs_code"], as_index=False)
         .agg(
-            value_thousand_usd=("value_thousand_usd", "sum"),
+            value_usd=("value_usd", "sum"),
             weight_metric_tons=("weight_metric_tons", "sum"),
         )
     )
-    exposure["value_usd"] = exposure["value_thousand_usd"] * 1000
+    # flag whether the exporter is an EFTA country (useful for downstream filtering/flags)
+    exposure["exporter_is_efta"] = exposure["exporter_iso3"].isin(EFTA_COUNTRIES)
 
     exposure = exposure.sort_values(
         ["importer_iso3", "value_usd", "weight_metric_tons", "good", "exporter_iso3"],
@@ -323,17 +486,86 @@ def main() -> None:
 
     subset = build_trade_subset(trade, forced_goods, good_to_hs_codes, code_to_iso3)
     exposure, summary = compute_exposure(trade, forced_goods, good_to_hs_codes, code_to_iso3)
+    eu_bloc_exposure = aggregate_eu_importer_bloc(exposure)
+    eu_bloc_summary = summarize_eu_bloc(eu_bloc_exposure)
+    eu_bloc_top_products = rank_eu_bloc_products(eu_bloc_exposure, top_n=20)
+    # EEA is EU + EFTA
+    eea_bloc_exposure = aggregate_eea_importer_bloc(exposure)
+    eea_bloc_summary = summarize_eea_bloc(eea_bloc_exposure)
+    eea_bloc_top_products = rank_eu_bloc_products(eea_bloc_exposure, top_n=20)
+
+    subset = format_numeric_output(
+        subset,
+        value_cols=["value_usd"],
+        weight_cols=["weight_metric_tons"],
+    )
+    exposure = format_numeric_output(
+        exposure,
+        value_cols=["value_usd"],
+        weight_cols=["weight_metric_tons"],
+    )
+    summary = format_numeric_output(
+        summary,
+        value_cols=["total_value_usd", "top_value_usd"],
+        weight_cols=["total_weight_metric_tons"],
+    )
+    eu_bloc_exposure = format_numeric_output(
+        eu_bloc_exposure,
+        value_cols=["value_usd"],
+        weight_cols=["weight_metric_tons"],
+    )
+    eu_bloc_summary = format_numeric_output(
+        eu_bloc_summary,
+        value_cols=["total_value_usd", "top_value_usd"],
+        weight_cols=["total_weight_metric_tons", "top_weight_metric_tons"],
+    )
+    eu_bloc_top_products = format_numeric_output(
+        eu_bloc_top_products,
+        value_cols=["value_usd"],
+        weight_cols=["weight_metric_tons"],
+    )
+    eea_bloc_exposure = format_numeric_output(
+        eea_bloc_exposure,
+        value_cols=["value_usd"],
+        weight_cols=["weight_metric_tons"],
+    )
+    eea_bloc_summary = format_numeric_output(
+        eea_bloc_summary,
+        value_cols=["total_value_usd", "top_value_usd"],
+        weight_cols=["total_weight_metric_tons", "top_weight_metric_tons"],
+    )
+    eea_bloc_top_products = format_numeric_output(
+        eea_bloc_top_products,
+        value_cols=["value_usd"],
+        weight_cols=["weight_metric_tons"],
+    )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     subset.to_csv(OUTPUT_DIR / "baci_forced_labor_subset.csv", index=False)
     exposure.to_csv(OUTPUT_DIR / "eu_forced_labor_exposure_by_origin.csv", index=False)
     summary.to_csv(OUTPUT_DIR / "eu_forced_labor_exposure_summary.csv", index=False)
+    eu_bloc_exposure.to_csv(OUTPUT_DIR / "eu_forced_labor_exposure_eu_bloc.csv", index=False)
+    eu_bloc_summary.to_csv(OUTPUT_DIR / "eu_forced_labor_exposure_eu_bloc_summary.csv", index=False)
+    eu_bloc_top_products.to_csv(OUTPUT_DIR / "eu_forced_labor_exposure_eu_bloc_top_products.csv", index=False)
+    eea_bloc_exposure.to_csv(OUTPUT_DIR / "eu_forced_labor_exposure_eea_bloc.csv", index=False)
+    eea_bloc_summary.to_csv(OUTPUT_DIR / "eu_forced_labor_exposure_eea_bloc_summary.csv", index=False)
+    eea_bloc_top_products.to_csv(OUTPUT_DIR / "eu_forced_labor_exposure_eea_bloc_top_products.csv", index=False)
 
     print("Saved baci_forced_labor_subset.csv")
     print("Saved eu_forced_labor_exposure_by_origin.csv")
     print("Saved eu_forced_labor_exposure_summary.csv")
+    print("Saved eu_forced_labor_exposure_eu_bloc.csv")
+    print("Saved eu_forced_labor_exposure_eu_bloc_summary.csv")
+    print("Saved eu_forced_labor_exposure_eu_bloc_top_products.csv")
+    print("Saved eu_forced_labor_exposure_eea_bloc.csv")
+    print("Saved eu_forced_labor_exposure_eea_bloc_summary.csv")
+    print("Saved eu_forced_labor_exposure_eea_bloc_top_products.csv")
     print("\nEU importer summary:")
     print(summary.sort_values("importer_iso3").to_string(index=False))
+    print("\nEU bloc summary:")
+    print(eu_bloc_summary.to_string(index=False))
+    print("\nEEA bloc summary:")
+    print(eea_bloc_summary.to_string(index=False))
 
 
 if __name__ == "__main__":
